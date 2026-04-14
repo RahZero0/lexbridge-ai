@@ -140,3 +140,4 @@ vite.config.ts.timestamp-*
 .DS_Store
 
 *.pyc
+kv_store_llm_response_cache.json
