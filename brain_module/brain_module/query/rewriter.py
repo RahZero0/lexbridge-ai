@@ -55,10 +55,10 @@ class QueryRewriter:
         enabled: bool = True,
     ) -> None:
         self._llm = llm_client
-        self._max_variants = max(2, max_variants)
+        self._max_variants = max(1, max_variants)
         self._enabled = enabled
 
-    async def rewrite(self, query: str) -> list[str]:
+    async def rewrite(self, query: str, *, max_variants_override: int | None = None) -> list[str]:
         """
         Return a list of query variants (original always first).
 
@@ -68,15 +68,19 @@ class QueryRewriter:
         if not self._enabled or not original:
             return [original]
 
+        max_variants = self._max_variants
+        if max_variants_override is not None:
+            max_variants = max(1, int(max_variants_override))
+
         if self._llm is not None:
             try:
-                return await self._llm_rewrite(original)
+                return await self._llm_rewrite(original, max_variants=max_variants)
             except Exception as exc:
                 logger.warning("LLM query rewrite failed, using original only: %s", exc)
 
         return [original]
 
-    async def _llm_rewrite(self, query: str) -> list[str]:
+    async def _llm_rewrite(self, query: str, *, max_variants: int) -> list[str]:
         messages = [
             {"role": "system", "content": _REWRITE_SYSTEM},
             {"role": "user", "content": query},
@@ -85,7 +89,7 @@ class QueryRewriter:
             messages, max_tokens=128, temperature=0.7
         )
         variants = self._parse_variants(raw_answer, query)
-        return [query] + variants[: self._max_variants - 1]
+        return [query] + variants[: max_variants - 1]
 
     @staticmethod
     def _parse_variants(raw: str, original: str) -> list[str]:

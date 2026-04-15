@@ -218,6 +218,16 @@ class AppState:
     context_compressor: SentenceCompressor
     retrieval_expansion_factor: float
     rerank_bypass_complexity_threshold: float
+    adaptive_pipeline_enabled: bool
+    fast_path_enabled: bool
+    adaptive_complexity_threshold: float
+    early_stop_retrieval_enabled: bool
+    early_stop_confidence_threshold: float
+    fast_path_max_rewrite_variants: int
+    fast_path_skip_rerank: bool
+    fast_path_expansion_factor: float
+    fast_path_top_n_context: int
+    fast_path_max_synth_tokens: int
     trace_dir: Path
     trace_enabled: bool
 
@@ -263,6 +273,28 @@ def _write_agentic_trace(trace_payload: dict[str, Any]) -> tuple[str, str] | tup
     return trace_id, f"/traces/{trace_id}"
 
 
+def _compute_pipeline_mode(plan: Any) -> str:
+    if not (_state.adaptive_pipeline_enabled and _state.fast_path_enabled):
+        return "deep"
+    if plan.intent.value != "factual":
+        return "deep"
+    if plan.complexity_score > _state.adaptive_complexity_threshold:
+        return "deep"
+    return "fast"
+
+
+def _compute_retrieval_confidence(chunks: list[dict[str, Any]]) -> float:
+    if not chunks:
+        return 0.0
+    ranked = sorted(chunks, key=lambda c: float(c.get("score", 0.0)), reverse=True)
+    top = ranked[:3]
+    top_score = float(top[0].get("score", 0.0))
+    avg_top = sum(float(c.get("score", 0.0)) for c in top) / max(len(top), 1)
+    unique_sources = len({(c.get("source") or c.get("source_url") or "") for c in top if c})
+    diversity = unique_sources / max(len(top), 1)
+    return max(0.0, min(1.0, (0.55 * top_score) + (0.30 * avg_top) + (0.15 * diversity)))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialise all pipeline components at startup."""
@@ -271,6 +303,26 @@ async def lifespan(app: FastAPI):
     )
     _state.rerank_bypass_complexity_threshold = _safe_float_env(
         "RERANK_BYPASS_COMPLEXITY_THRESHOLD", default=0.25, minimum=0.0
+    )
+    _state.adaptive_pipeline_enabled = _env_bool("ADAPTIVE_PIPELINE_ENABLED", False)
+    _state.fast_path_enabled = _env_bool("FAST_PATH_ENABLED", False)
+    _state.adaptive_complexity_threshold = _safe_float_env(
+        "ADAPTIVE_COMPLEXITY_THRESHOLD", default=0.35, minimum=0.0
+    )
+    _state.early_stop_retrieval_enabled = _env_bool("EARLY_STOP_RETRIEVAL_ENABLED", False)
+    _state.early_stop_confidence_threshold = _safe_float_env(
+        "EARLY_STOP_CONFIDENCE_THRESHOLD", default=0.78, minimum=0.0
+    )
+    _state.fast_path_max_rewrite_variants = _safe_int_env(
+        "FAST_PATH_MAX_REWRITE_VARIANTS", default=1, minimum=1
+    )
+    _state.fast_path_skip_rerank = _env_bool("FAST_PATH_SKIP_RERANK", True)
+    _state.fast_path_expansion_factor = _safe_float_env(
+        "FAST_PATH_RETRIEVAL_EXPANSION_FACTOR", default=1.0, minimum=1.0
+    )
+    _state.fast_path_top_n_context = _safe_int_env("FAST_PATH_TOP_N_CONTEXT", default=3, minimum=1)
+    _state.fast_path_max_synth_tokens = _safe_int_env(
+        "FAST_PATH_MAX_SYNTH_TOKENS", default=512, minimum=64
     )
     _state.trace_enabled = _env_bool("AGENTIC_TRACE_ENABLED", True)
     _state.trace_dir = Path(os.getenv("AGENTIC_TRACE_DIR", "/tmp/brain_module_traces"))
@@ -399,7 +451,7 @@ async def lifespan(app: FastAPI):
         "Brain module ready. Registered fetchers: %s | expansion_factor=%.1f | top_n_before_rerank=%d"
         " | guardrails: min_rerank=%.3f max_same_src=%d low_conf=%.3f strict=%s judge=%s"
         " | query_rewrite=%s (max_variants=%d) | compression=%s | embedding_cache=%s"
-        " | llm=%s | semantic_cache=%s (thresh=%.2f)",
+        " | adaptive=%s fast_path=%s early_stop=%s | llm=%s | semantic_cache=%s (thresh=%.2f)",
         _state.registry.available(),
         _state.retrieval_expansion_factor,
         top_n_before_rerank,
@@ -412,6 +464,9 @@ async def lifespan(app: FastAPI):
         query_rewrite_max_variants,
         compression_enabled,
         embedding_cache_enabled,
+        _state.adaptive_pipeline_enabled,
+        _state.fast_path_enabled,
+        _state.early_stop_retrieval_enabled,
         tiered_info,
         semantic_cache_enabled,
         semantic_cache_threshold,
@@ -578,13 +633,20 @@ async def _run_pipeline(req: AskRequest) -> tuple[BrainResponse, dict[str, Any]]
     route_t0 = time.perf_counter()
     plan = _state.router.route(req.question)
     active_fetchers = req.fetchers or plan.fetchers
+    pipeline_mode = _compute_pipeline_mode(plan)
+    is_fast_path = pipeline_mode == "fast"
+    rewrite_cap = _state.fast_path_max_rewrite_variants if is_fast_path else None
+    expansion_factor = (
+        _state.fast_path_expansion_factor if is_fast_path else _state.retrieval_expansion_factor
+    )
     timings["routing"] = (time.perf_counter() - route_t0) * 1000
     logger.info(
-        "Query: %r | intent=%s | fetchers=%s | complexity=%.2f",
+        "Query: %r | intent=%s | fetchers=%s | complexity=%.2f | mode=%s",
         req.question[:60],
         plan.intent.value,
         active_fetchers,
         plan.complexity_score,
+        pipeline_mode,
     )
 
     # Fast path for non-CQA small-talk queries.
@@ -675,14 +737,16 @@ async def _run_pipeline(req: AskRequest) -> tuple[BrainResponse, dict[str, Any]]
 
     # 3. Query rewriting (expand into multiple variants for better recall)
     rewrite_t0 = time.perf_counter()
-    query_variants = await _state.query_rewriter.rewrite(req.question)
+    query_variants = await _state.query_rewriter.rewrite(
+        req.question, max_variants_override=rewrite_cap
+    )
     timings["query_rewrite"] = (time.perf_counter() - rewrite_t0) * 1000
     if len(query_variants) > 1:
         logger.info("Query rewritten into %d variants: %s", len(query_variants), query_variants)
 
     # 4. Parallel fetch (across all query variants)
     fetch_t0 = time.perf_counter()
-    fetch_top_k = int(req.top_k * _state.retrieval_expansion_factor)
+    fetch_top_k = int(req.top_k * expansion_factor)
     all_raw_chunks: list[dict] = []
     all_traces: list = []
 
@@ -708,9 +772,15 @@ async def _run_pipeline(req: AskRequest) -> tuple[BrainResponse, dict[str, Any]]
 
     # 6. Re-rank (can be skipped for low-complexity factual queries)
     rerank_t0 = time.perf_counter()
+    retrieval_confidence = _compute_retrieval_confidence(fused)
+    early_stop_applied = (
+        _state.early_stop_retrieval_enabled
+        and retrieval_confidence >= _state.early_stop_confidence_threshold
+    )
     bypass_rerank = (
-        plan.intent.value == "factual"
-        and plan.complexity_score <= _state.rerank_bypass_complexity_threshold
+        (plan.intent.value == "factual" and plan.complexity_score <= _state.rerank_bypass_complexity_threshold)
+        or (is_fast_path and _state.fast_path_skip_rerank)
+        or early_stop_applied
     )
     if bypass_rerank:
         reranked = sorted(fused, key=lambda c: c.get("score", 0.0), reverse=True)[: req.top_k]
@@ -727,6 +797,9 @@ async def _run_pipeline(req: AskRequest) -> tuple[BrainResponse, dict[str, Any]]
         retrieval_traces=all_traces,
         answer_type=plan.intent,
         latency_ms=latency_ms,
+        top_k_override=_state.fast_path_top_n_context if is_fast_path else None,
+        max_tokens_override=_state.fast_path_max_synth_tokens if is_fast_path else None,
+        enable_compression_override=not early_stop_applied,
     )
     timings["synthesis"] = (time.perf_counter() - synth_t0) * 1000
     timings["total"] = (time.perf_counter() - t0) * 1000
@@ -737,7 +810,11 @@ async def _run_pipeline(req: AskRequest) -> tuple[BrainResponse, dict[str, Any]]
         "complexity": plan.complexity_score,
         "reasoning": plan.reasoning,
         "fetchers_used": active_fetchers,
+        "pipeline_mode": pipeline_mode,
+        "adaptive_pipeline_enabled": _state.adaptive_pipeline_enabled,
         "rerank_bypassed": bypass_rerank,
+        "early_stop_applied": early_stop_applied,
+        "retrieval_confidence": round(retrieval_confidence, 4),
     }
     response_dict["latency_breakdown_ms"] = {k: round(v, 2) for k, v in timings.items()}
     response_dict["from_cache"] = False
@@ -990,6 +1067,12 @@ async def ask_stream(req: AskRequest):
         route_t0 = time.perf_counter()
         plan = _state.router.route(req.question)
         active_fetchers = req.fetchers or plan.fetchers
+        pipeline_mode = _compute_pipeline_mode(plan)
+        is_fast_path = pipeline_mode == "fast"
+        rewrite_cap = _state.fast_path_max_rewrite_variants if is_fast_path else None
+        expansion_factor = (
+            _state.fast_path_expansion_factor if is_fast_path else _state.retrieval_expansion_factor
+        )
         timings["routing"] = (time.perf_counter() - route_t0) * 1000
 
         # 1b. Set tiered LLM complexity
@@ -1000,12 +1083,14 @@ async def ask_stream(req: AskRequest):
 
         # 2. Query rewriting
         rewrite_t0 = time.perf_counter()
-        query_variants = await _state.query_rewriter.rewrite(req.question)
+        query_variants = await _state.query_rewriter.rewrite(
+            req.question, max_variants_override=rewrite_cap
+        )
         timings["query_rewrite"] = (time.perf_counter() - rewrite_t0) * 1000
 
         # 3. Parallel fetch across all query variants + aggregate + rerank
         fetch_t0 = time.perf_counter()
-        fetch_top_k = int(req.top_k * _state.retrieval_expansion_factor)
+        fetch_top_k = int(req.top_k * expansion_factor)
         all_raw_chunks: list[dict] = []
 
         fetch_coros = [
@@ -1026,9 +1111,15 @@ async def ask_stream(req: AskRequest):
         timings["aggregate"] = (time.perf_counter() - agg_t0) * 1000
 
         rerank_t0 = time.perf_counter()
+        retrieval_confidence = _compute_retrieval_confidence(fused)
+        early_stop_applied = (
+            _state.early_stop_retrieval_enabled
+            and retrieval_confidence >= _state.early_stop_confidence_threshold
+        )
         bypass_rerank = (
-            plan.intent.value == "factual"
-            and plan.complexity_score <= _state.rerank_bypass_complexity_threshold
+            (plan.intent.value == "factual" and plan.complexity_score <= _state.rerank_bypass_complexity_threshold)
+            or (is_fast_path and _state.fast_path_skip_rerank)
+            or early_stop_applied
         )
         if bypass_rerank:
             reranked = sorted(fused, key=lambda c: c.get("score", 0.0), reverse=True)[: req.top_k]
@@ -1038,7 +1129,8 @@ async def ask_stream(req: AskRequest):
 
         # 4. Context compression
         compress_t0 = time.perf_counter()
-        reranked = _state.context_compressor.compress(req.question, reranked)
+        if not early_stop_applied:
+            reranked = _state.context_compressor.compress(req.question, reranked)
         timings["context_compression"] = (time.perf_counter() - compress_t0) * 1000
 
         # 5. Apply retrieval guardrails and build source cards
@@ -1048,7 +1140,9 @@ async def ask_stream(req: AskRequest):
         from ..synthesis.prompt_builder import build_synthesis_prompt
 
         synth_eng = _state.synthesis_engine
-        top_chunks = reranked[: synth_eng._top_k]
+        top_k_budget = _state.fast_path_top_n_context if is_fast_path else synth_eng._top_k
+        max_tokens_budget = _state.fast_path_max_synth_tokens if is_fast_path else 1024
+        top_chunks = reranked[:top_k_budget]
         top_chunks = filter_low_relevance(
             top_chunks, min_score=synth_eng._min_rerank_score, min_keep=1
         )
@@ -1096,7 +1190,7 @@ async def ask_stream(req: AskRequest):
         full_answer = ""
         synth_t0 = time.perf_counter()
         try:
-            async for token in llm.stream(messages, max_tokens=1024, temperature=0.2):
+            async for token in llm.stream(messages, max_tokens=max_tokens_budget, temperature=0.2):
                 full_answer += token
                 yield _sse({"type": "token", "text": token})
         except Exception as exc:
@@ -1156,7 +1250,11 @@ async def ask_stream(req: AskRequest):
                     "complexity": plan.complexity_score,
                     "reasoning": plan.reasoning,
                     "fetchers_used": active_fetchers,
+                    "pipeline_mode": pipeline_mode,
+                    "adaptive_pipeline_enabled": _state.adaptive_pipeline_enabled,
                     "rerank_bypassed": bypass_rerank,
+                    "early_stop_applied": early_stop_applied,
+                    "retrieval_confidence": round(retrieval_confidence, 4),
                 },
                 "latency_breakdown_ms": latency_breakdown,
                 "from_cache": False,
@@ -1173,6 +1271,8 @@ async def ask_stream(req: AskRequest):
             "latency_breakdown_ms": latency_breakdown,
             "model_used": llm.model_id,
             "guardrail_flags": guardrail_flags,
+            "pipeline_mode": pipeline_mode,
+            "early_stop_applied": early_stop_applied,
             "from_cache": False,
         })
 

@@ -97,13 +97,26 @@ class SynthesisEngine:
         retrieval_traces: list[RetrievalTrace] | None = None,
         answer_type: Any = None,
         latency_ms: float = 0.0,
+        top_k_override: int | None = None,
+        max_tokens_override: int | None = None,
+        enable_compression_override: bool | None = None,
     ) -> BrainResponse:
         """
         Build answer from top-K re-ranked chunks.
 
         Returns a BrainResponse even if the LLM call fails (error field is set).
         """
-        top_chunks = reranked_chunks[: self._top_k]
+        top_k = self._top_k if top_k_override is None else max(1, int(top_k_override))
+        max_tokens = (
+            self._max_tokens if max_tokens_override is None else max(64, int(max_tokens_override))
+        )
+        compression_enabled = (
+            self._compressor is not None
+            if enable_compression_override is None
+            else bool(enable_compression_override and self._compressor is not None)
+        )
+
+        top_chunks = reranked_chunks[:top_k]
 
         # --- Layer 1: retrieval guardrails ---
         top_chunks = filter_low_relevance(
@@ -115,7 +128,7 @@ class SynthesisEngine:
         )
 
         # --- Context compression (extractive sentence-level) ---
-        if self._compressor is not None:
+        if compression_enabled:
             top_chunks = self._compressor.compress(question, top_chunks)
 
         source_cards = _chunks_to_source_cards(top_chunks)
@@ -159,7 +172,7 @@ class SynthesisEngine:
         try:
             raw_answer, model_used = await self._llm.complete(
                 messages,
-                max_tokens=self._max_tokens,
+                max_tokens=max_tokens,
                 temperature=self._temperature,
             )
         except Exception as exc:

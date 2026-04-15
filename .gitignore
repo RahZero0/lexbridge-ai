@@ -142,3 +142,5 @@ vite.config.ts.timestamp-*
 *.pyc
 kv_store_llm_response_cache.json
 data_module/data/*
+
+*.pkl.gz
