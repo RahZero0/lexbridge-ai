@@ -80,7 +80,7 @@ Related to #
 
 ```
 Paste here
-
+```
 ---
 
 ## ✅ Checklist
@@ -89,5 +89,4 @@ Paste here
 - [ ] No breaking changes
 - [ ] Documentation updated (if needed)
 - [ ] Follows project structure
-```
 
