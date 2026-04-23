@@ -1,80 +1,85 @@
-# Data Module
+# Folder: data_module
 
-A modular data ingestion, storage, and retrieval pipeline for QA datasets. Designed to feed **Agentic RAG**, **knowledge graphs**, and **fast vector retrieval** systems.
+## Overview
 
-## Data Sources
+This folder contains the following files and their summaries.
 
-| Source | License | Size | Access |
-|---|---|---|---|
-| Stack Exchange Dump (Apr 2024) | CC BY-SA 4.0 | ~100 GB | archive.org |
-| Wikipedia Dumps | CC BY-SA 4.0 + GFDL | ~22 GB | dumps.wikimedia.org |
-| Wikidata | CC0 | ~100 GB | dumps.wikimedia.org |
-| SQuAD 2.0 | CC BY-SA 4.0 | ~50 MB | Hugging Face |
-| Natural Questions | CC BY-SA 3.0 | ~4 GB | Google Cloud Storage |
-| MS MARCO | CC BY 4.0 | ~2 GB | msmarco.org / HF |
-| HotpotQA | CC BY-SA 4.0 | ~600 MB | hotpotqa.github.io |
-| TriviaQA | Apache 2.0 | ~2.5 GB | UW NLP / HF |
-| OpenAssistant OASST2 | Apache 2.0 | ~200 MB | Hugging Face |
+## Files
 
-> **Yahoo CQA** is not included — it is only available through Yahoo WebScope (academic registration + non-commercial agreement required).
+### pyproject.toml
 
-## Attribution Requirements
+# File: pyproject.toml
 
-All CC BY-SA sources require:
-1. Attribution of original URL and author per record
-2. Derivative datasets must use the same or compatible CC BY-SA license
+## Purpose
+Configures the project's build system, dependencies, and metadata.
 
-Since several sources are CC BY-SA, the combined derived dataset must also be released under CC BY-SA.
+## Key Components
 
-## Architecture
+* **Build System**: The `build-system` section specifies the requirements for building the project using `setuptools` as the backend.
+* **Project Metadata**: The `[project]` section contains metadata about the project, including its name, version, description, license, and dependencies.
+* **Dependencies**: The project depends on various packages, categorized into core, data processing, text processing, embeddings, graph, Hugging Face, HTTP/downloads, and BM25/hybrid search libraries.
+* **Optional Dependencies**: Some dependencies are marked as optional, including `neo4j`, `openai`, and `dev` tools for testing and formatting.
 
-```
-Raw XML/JSON → Source Parser → CanonicalQA
-                                    ├── Normalizer/Cleaner
-                                    │       └── Parquet Archive (cold)
-                                    │       └── DuckDB (analytics)
-                                    ├── Chunker → ChunkRecord
-                                    │       └── Embedder → LanceDB (hot vector index)
-                                    └── Triple Extractor → Graph Store
-```
+## Important Logic
 
-## Quickstart
+* The project requires Python 3.10 or higher to run.
+* The project uses `setuptools` as the build backend with version 68 or higher.
+* The project has several scripts defined in the `[project.scripts]` section, including `data-download`, `data-pipeline`, and `data-index`.
 
-```bash
-pip install -e ".[dev]"
-python -m spacy download en_core_web_sm
+## Dependencies
 
-# Download a source
-data-download stackexchange --sites stackoverflow --limit 10000
-data-download squad
-data-download openassistant
+### Core Libraries
 
-# Run the full pipeline
-data-pipeline run --source stackexchange --chunk-strategy canonical_qa
+* `pydantic`
+* `python-dotenv`
+* `pyyaml`
+* `rich`
+* `typer`
+* `tqdm`
 
-# Build vector and graph indexes
-data-index build --source all
-```
+### Data Processing
 
-## Project Structure
+* `pyarrow`
+* `pandas`
+* `duckdb`
+* `lancedb`
 
-```
-data_module/
-├── config/           # Per-source and pipeline YAML configs
-├── data_module/
-│   ├── schema/       # Pydantic models (CanonicalQA, ChunkRecord, Triple)
-│   ├── sources/      # Per-source downloaders, parsers, mappers
-│   ├── pipelines/    # ETL stages (ingest, transform, chunk, embed, graph)
-│   ├── storage/      # Storage backends (Parquet, DuckDB, LanceDB, SQLite, Graph)
-│   └── fetch/        # Retrieval APIs (fast_rag, graph_rag, hybrid, agentic)
-├── scripts/          # CLI entry points
-└── data/             # .gitignored — downloaded and processed data
-```
+### Text Processing
 
-## Storage Backends
+* `beautifulsoup4`
+* `html2text`
+* `spacy`
+* `langdetect`
 
-- **Parquet** — cold archive, batch reprocessing, fine-tuning datasets
-- **DuckDB** — fast SQL analytics over Parquet
-- **LanceDB** — hot vector index for fast semantic RAG
-- **SQLite** — pipeline state, source → canonical ID mappings
-- **NetworkX / Neo4j** — knowledge graph (dev / prod)
+### Embeddings
+
+* `sentence-transformers`
+* `numpy`
+
+### Graph
+
+* `networkx`
+
+### Hugging Face
+
+* `datasets`
+* `huggingface-hub`
+
+### HTTP / Downloads
+
+* `httpx`
+* `aiofiles`
+* `py7zr`
+
+### BM25 / Hybrid Search
+
+* `rank-bm25`
+
+## Notes
+
+* The project uses the `CC-BY-SA-4.0` license.
+* The project has a README file named `README.md`.
+* The project uses various tools for testing and formatting, including `pytest`, `black`, and `ruff`.
+
+---
+
