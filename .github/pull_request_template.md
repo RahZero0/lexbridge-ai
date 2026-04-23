@@ -1,3 +1,5 @@
+> ⚠️ PRs will NOT be merged without approval from @RahZero0
+
 ## 📌 Description
 
 <!-- What does this PR do? Give a clear and concise summary -->
